@@ -1,2 +1,90 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+import time
+import torch
+import requests
+import re
+import pandas as pd
+from bs4 import BeautifulSoup
+from transformers import BertTokenizer, BertForSequenceClassification
+
+# 加载 FinBERT 模型和 tokenizer
+tokenizer = BertTokenizer.from_pretrained("yiyanghkust/finbert-tone")
+model = BertForSequenceClassification.from_pretrained("yiyanghkust/finbert-tone")
+
+# 使用 FinBERT 进行情感分析
+def calculate_sentiment_finbert(text):
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=512)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    probs = torch.nn.functional.softmax(outputs.logits, dim=-1).cpu()  # 确保数据在 CPU 上计算
+    sentiment_scores = {
+        "positive": probs[0][0].item(),
+        "neutral": probs[0][1].item(),
+        "negative": probs[0][2].item(),
+        "compound": probs[0][0].item() - probs[0][2].item()
+    }
+    return sentiment_scores
+
+# 提取符合格式的链接
+def extract_secondary_links(url, year):
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        links = soup.find_all('a', href=True)
+        regex = re.compile(r'\d{4}.*\.htm$')
+        valid_links = [link['href'] for link in links if regex.search(link['href'])]
+        if year >= 2017:
+            valid_links = [f"https://www.federalreserve.gov{link}" for link in valid_links]
+        return valid_links
+    except requests.RequestException as e:
+        print(f"⚠️ Failed to retrieve or parse {url}: {e}")
+        return []
+
+# 提取报告文本
+def extract_text_from_report(url):
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        paragraphs = soup.find_all('p')
+        text = " ".join([p.get_text() for p in paragraphs])
+        return text if text else None
+    except requests.RequestException as e:
+        print(f"⚠️ Failed to retrieve or parse {url}: {e}")
+        return None
+
+# 存储分析结果
+results = []
+
+# 遍历每年的 Beige Book 数据
+for year in range(1996, 2024):
+    url = f"https://www.federalreserve.gov/monetarypolicy/beigebook{year}.htm"
+    valid_links = extract_secondary_links(url, year)
+    
+    for link in valid_links:
+        report_text = extract_text_from_report(link)
+        
+        if report_text:
+            sentiment = calculate_sentiment_finbert(report_text)
+            results.append({
+                "year": year,
+                "link": link,
+                "compound_score": sentiment['compound'],
+                "positive_score": sentiment['positive'],
+                "neutral_score": sentiment['neutral'],
+                "negative_score": sentiment['negative']
+            })
+            print(f"✅ Processed: {link}")
+        else:
+            print(f"⚠️ Skipped: {link} (No content extracted)")
+
+        time.sleep(1)  
+
+import os
+os.makedirs("output", exist_ok=True)
+
+df = pd.DataFrame(results)
+output_file = "output/beigebook_finbert_sentiment_analysis.csv"
+df.to_csv(output_file, index=False)
+
+print(f"📄 Results saved to {output_file}")
